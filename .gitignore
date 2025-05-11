@@ -1,0 +1,10 @@
+.vs
+.vscode
+.idea
+lab.txt
+matmul.sln
+matmul.vcxproj
+matmul.vcxproj.user
+vscode*
+x64
+kernel.cu
