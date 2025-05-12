@@ -307,9 +307,166 @@ Kernel Execution Performance: 9611.92 GFLOPS.
 - Our best custom implementation (Warp Tiling) achieves impressive performance but is outperformed by standard cuBLAS FP32 by approximately 29%.
 - The mixed-precision cuBLAS implementation is 222% faster than our best custom implementation, demonstrating the extraordinary performance gains possible when leveraging tensor cores and reduced precision operations.
 
-
 #### Important Note on Performance Measurement
 To achieve these optimal cuBLAS performance results, it was necessary to add a warm-up run before the timed execution. This warm-up run amortizes initialization overhead, including kernel compilation, memory allocation, and internal cuBLAS configuration. Without this warm-up pass, the measured performance would be significantly lower due to these one-time initialization costs being included in the measurement.
+
+## Optional: [Bonus Question]
+
+### 1. TensorCore in NVIDIA Streaming Multiprocessors
+
+#### Principle and Benefits of TensorCores
+
+TensorCores are specialized hardware units in modern NVIDIA GPUs (Volta architecture and later) designed to accelerate matrix multiplication operations. They provide dedicated matrix-multiply-and-accumulate (MMA) units that can perform mixed-precision matrix operations with exceptional throughput.
+
+**Core Principles:**
+
+1. **Matrix Math Acceleration**: TensorCores perform matrix operations in a single clock cycle that would take multiple cycles on traditional CUDA cores.
+
+2. **Mixed Precision Computing**: TensorCores operate on lower precision inputs (FP16 or BF16) but accumulate results in higher precision (FP32), providing both performance and accuracy benefits.
+
+3. **Specialized Matrix Instructions**: TensorCores use specialized instructions (WMMA - Warp Matrix Multiply-Accumulate) that operate on matrix fragments rather than individual values.
+
+**Key Benefits:**
+
+1. **Dramatically Higher Compute Throughput**: TensorCores can deliver up to 8× higher peak FLOPS compared to standard FP32 operations on the same GPU.
+
+2. **Mixed Precision Without Accuracy Loss**: While inputs are FP16, accumulation in FP32 maintains numerical stability for most applications.
+
+3. **Memory Bandwidth Efficiency**: Lower precision inputs (FP16) require half the memory bandwidth of FP32, effectively doubling the available bandwidth.
+
+4. **Energy Efficiency**: TensorCores perform more calculations per watt than standard CUDA cores.
+
+#### TensorCore Implementation
+
+Our implementation uses NVIDIA's WMMA (Warp Matrix Multiply-Accumulate) API, which provides a high-level interface to program TensorCores. Here's how the implementation works:
+
+**Host Program:**
+
+```cpp
+// Matrix dimensions (N×N matrices)
+int N = 8192;
+int M = N;
+int K = N;
+
+// Allocate host memory and initialize with FP16 data
+vector<half> h_a(N * N);  // Input matrix A in FP16
+vector<half> h_b(N * N);  // Input matrix B in FP16
+vector<float> h_c(N * N); // Output matrix C in FP32
+
+// Initialize matrices with FP16 values
+for (int i = 0; i < M * K; i++) h_a[i] = __float2half(1.0f);
+for (int i = 0; i < K * N; i++) h_b[i] = __float2half(1.0f);
+
+// Allocate device memory
+half* d_a, * d_b;  // Device FP16 input matrices
+float* d_c;        // Device FP32 output matrix
+cudaMalloc(&d_a, sizeof(half) * M * K);
+cudaMalloc(&d_b, sizeof(half) * K * N);
+cudaMalloc(&d_c, sizeof(float) * M * N);
+
+// Copy data to the device
+cudaMemcpy(d_a, h_a.data(), M * K * sizeof(half), cudaMemcpyHostToDevice);
+cudaMemcpy(d_b, h_b.data(), N * K * sizeof(half), cudaMemcpyHostToDevice);
+
+// Calculate grid and block dimensions based on TensorCore dimensions (16×16×16)
+dim3 gridDim(ceil(static_cast<float>(M) / WMMA_M), 
+             ceil(static_cast<float>(N) / WMMA_N), 1);
+dim3 blockDim(32, 32, 1);  // 32 threads in x, 32 threads in y
+
+// Warm-up run to amortize initialization overhead
+wmmaMatrixMultiply<<<gridDim, blockDim>>>(d_a, d_b, d_c, M, N, K);
+cudaDeviceSynchronize();
+
+// Launch actual kernel
+wmmaMatrixMultiply<<<gridDim, blockDim>>>(d_a, d_b, d_c, M, N, K);
+
+// Copy results back to host
+cudaMemcpy(h_c.data(), d_c, sizeof(float) * M * N, cudaMemcpyDeviceToHost);
+```
+
+**Kernel Implementation:**
+
+```cpp
+__global__ void wmmaMatrixMultiply(half* A, half* B, float* C, int M, int N, int K) {
+    // Calculate which warp in the grid this thread belongs to
+    int warpM = (blockIdx.x * blockDim.x + threadIdx.x) / warpSize;
+    int warpN = blockIdx.y * blockDim.y + threadIdx.y;
+    
+    // Declare matrix fragments for TensorCore operations
+    // These fragments store portions of the input and output matrices
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, half, 
+                           nvcuda::wmma::row_major> a_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, half, 
+                           nvcuda::wmma::row_major> b_frag;
+    nvcuda::wmma::fragment<nvcuda::wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, 
+                           float> c_frag;
+    
+    // Initialize accumulator fragment to zeros
+    nvcuda::wmma::fill_fragment(c_frag, 0.0f);
+    
+    // Loop through K dimension in steps of TensorCore tile size (WMMA_K)
+    for (int k = 0; k < K; k += WMMA_K) {
+        // Calculate starting positions for loading matrix tiles
+        int aRow = warpM * WMMA_M;
+        int aCol = k;
+        int bRow = k;
+        int bCol = warpN * WMMA_N;
+        
+        // Check if this warp's assigned work is within matrix bounds
+        if (aRow < M && aCol < K && bRow < K && bCol < N) {
+            // Load matrix tiles into TensorCore fragments
+            nvcuda::wmma::load_matrix_sync(a_frag, A + aRow * K + aCol, K);
+            nvcuda::wmma::load_matrix_sync(b_frag, B + bRow * N + bCol, N);
+            
+            // Perform matrix multiplication using TensorCores
+            nvcuda::wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+        }
+    }
+    
+    // Calculate output position for storing result
+    int cRow = warpM * WMMA_M;
+    int cCol = warpN * WMMA_N;
+    
+    // Store accumulated result back to global memory
+    if (cRow < M && cCol < N) {
+        nvcuda::wmma::store_matrix_sync(C + cRow * N + cCol, c_frag, N, 
+                                        nvcuda::wmma::mem_row_major);
+    }
+}
+```
+
+#### Performance Comparison
+
+We compared the TensorCore implementation with our previously implemented Block Tiled 16×16 matrix multiplication algorithm, which uses the same block size but relies on standard CUDA cores rather than TensorCores:
+
+| Implementation | Performance (GFLOPS) | Speedup vs Block Tiled 16×16 |
+|----------------|---------------------|------------------------------|
+| Block Tiled 16×16 | 1422.85 | 1.00× |
+| TensorCore | 6268.35 | 4.41× |
+| cuBLAS (FP32) | 12431.02 | 8.74× |
+| cuBLAS (FP16/BF16) | 30923.96 | 21.73× |
+
+#### Analysis of TensorCore Performance
+
+The TensorCore implementation achieved a 4.41× speedup over the Block Tiled 16×16 implementation, despite both using the same general approach and block dimensions. This dramatic performance difference can be attributed to several key advantages of TensorCores:
+
+1. **Hardware-Accelerated Matrix Operations**: TensorCores perform matrix operations in specialized hardware units that are optimized specifically for these operations, whereas CUDA cores are general-purpose compute units.
+
+2. **Parallel Execution at Warp-Level**: TensorCores operate on matrix fragments in a synchronized manner across an entire warp, enabling higher efficiency than individual thread operations.
+
+3. **Mixed Precision Advantage**: Using FP16 for inputs reduces memory bandwidth requirements while maintaining computational accuracy through FP32 accumulation. This mixed-precision approach effectively doubles available memory bandwidth.
+
+4. **Reduced Instruction Count**: TensorCore operations replace numerous individual multiply-add operations with single warp-wide matrix operations, significantly reducing instruction overhead.
+
+5. **Memory Access Efficiency**: The WMMA API optimizes the memory access patterns for TensorCore operations, further enhancing performance.
+
+While our TensorCore implementation shows impressive performance, it still falls short of the cuBLAS library (approximately 50% of cuBLAS FP32 performance). This gap exists because:
+
+- cuBLAS includes advanced memory access optimizations and heuristics developed over many years
+- cuBLAS uses autotuning to select optimal parameters for a given GPU architecture
+- Our TensorCore implementation is relatively simple and could benefit from additional optimizations
+
+Nevertheless, the 4.41× speedup over our optimized Block Tiled implementation demonstrates the tremendous potential of TensorCores for accelerating matrix multiplication operations, even with relatively straightforward implementations.
 
 ## Conclusion
 
@@ -325,4 +482,9 @@ This lab demonstrates the importance of memory access patterns and hierarchical 
    - 2D Block Tiling: 5.3× speedup
    - Vectorization: 6.0× speedup
    - Warp Tiling: 7.1× speedup
+
+4. **TensorCore acceleration** provides dramatic performance improvements:
+   - 4.4× speedup over equivalent CUDA core implementation
+   - Mixed precision operations enable significantly higher throughput
+   - Hardware-specific accelerators like TensorCores represent the future of high-performance matrix operations
 

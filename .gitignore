@@ -8,3 +8,4 @@ matmul.vcxproj.user
 vscode*
 x64
 kernel.cu
+very_complicated approach_doesnt_work.cu
