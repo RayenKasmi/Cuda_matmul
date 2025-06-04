@@ -1,5 +1,26 @@
 # CUDA Matrix Multiplication Lab Report
 
+## Table of Contents
+
+- [Part 1: Basic Matrix Multiplication Implementations](#part-1-basic-matrix-multiplication-implementations)
+  - [1. NVIDIA GPU Specifications](#1-nvidia-gpu-specifications)
+  - [2. MatmulXrow vs MatmulYrow (Float)](#2-matmulxrow-vs-matmulyrow-float)
+  - [3. Float vs Integer Matrix Multiplication](#3-float-vs-integer-matrix-multiplication)
+  - [4. Block Tiling Approach](#4-block-tiling-approach)
+- [Part 2: Advanced Optimization Techniques](#part-2-advanced-optimization-techniques)
+  - [1. Improved 1D Block Tiling](#1-improved-1d-block-tiling)
+  - [2. Improved 2D Block Tiling with Register Blocking](#2-improved-2d-block-tiling-with-register-blocking)
+  - [3. Vectorized Shared and Global Memory Accesses](#3-vectorized-shared-and-global-memory-accesses)
+  - [4. Warp-Level Tiling](#4-warp-level-tiling)
+- [Part 3: cuBLAS Implementation](#part-3-cublas-implementation)
+  - [Standard cuBLAS Implementation (FP32)](#standard-cublas-implementation-fp32)
+  - [Mixed-Precision cuBLAS](#mixed-precision-cublas)
+- [TensorCore in NVIDIA SMs](#tensor-core-implementation)
+  - [TensorCore Principle and Benefits](#principle-and-benefits-of-tensorcores)
+  - [Tesor Core Implementation](#tensor-core-implementation)
+  - [Performance Comparison](#performance-comparison)
+- [Conclusion](#conclusion)
+
 ## Part 1: Basic Matrix Multiplication Implementations
 
 ### 1. NVIDIA GPU Specifications
@@ -215,73 +236,55 @@ Kernel Execution Performance: 8128.81 GFLOPS.
 
 We notice a 6.01 times (501%) increase compared to the baseline and a 1.14 times increase (14%) compared to the simple 2D blocktiling approach.
 
-### 4. Warptiling in Matrix Multiplication (Matmul)
+### 4. Warp-Level Tiling
 
-#### Technique Description
+#### Concept and Benefits
 
-This optimization **introduces an extra level of tiling** in the matrix multiplication, called **warptiling**, between blocktiling and threadtiling.  
-It **organizes the work inside a warp** (32 threads) more systematically to better match the GPU hardware capabilities, especially warp schedulers and register usage.
+Warp-level tiling introduces an **intermediate level of granularity** in the matrix multiplication hierarchy, situated between block-level tiling and thread-level work. This approach recognizes and leverages the fundamental execution unit of NVIDIA GPUs: the **warp** (a group of 32 threads that execute in lockstep).
 
-Unlike blocks and threads, **warps are not explicit in CUDA code** — they are a hardware scheduling unit. We simulate warp-level organization by calculating a thread's `warpId` using:
+**Key Concept:**
+While thread blocks and individual threads are explicit programming constructs in CUDA, warps are the actual **hardware execution units**. By organizing computation specifically around these 32-thread units, warp-level tiling aligns the algorithm with the GPU's physical execution model.
 
-`warpId = threadIdx.x % warpSize;`
+This creates a three-tiered hierarchy of parallelism:
 
-where `warpSize = 32`.
+1. **Block-level parallelism**: Different thread blocks execute independently across SMs (Streaming Multiprocessors)
+2. **Warp-level parallelism**: Within a block, warps execute independently on warp schedulers
+3. **Thread-level parallelism**: Within a warp, individual threads compute multiple elements using register reuse
 
-By grouping threads into warp-sized tiles, **memory accesses** become more coalesced, **register usage** becomes more cache-friendly, and the **SM's warp schedulers** can be better utilized.
+#### Implementation Strategy
 
-#### How It Works
+The warp-tiling approach structures the computation as follows:
 
-- **Three levels of parallelism** are introduced:
-    
-    - **Blocktiling**: Different blocks run independently on different SMs (Streaming Multiprocessors).
-        
-    - **Warptiling**: Inside a block, different warps run independently on warp schedulers.
-        
-    - **Threadtiling**: Inside a warp, each thread computes a tiny piece using instruction-level parallelism (ILP).
-        
-- Inside the main loop:
-    
-    - **Load A and B subtiles** from shared memory into thread-local **registers**.
-        
-    - **Registers are organized** so each thread handles multiple small pieces of the matrix (multiple rows and columns).
-        
-    - **Small matrix multiplies** are performed using **registers** to maximize speed and locality.
-        
-    - This structure makes it easy to later map the computation to **tensor cores** using warp-wide matrix instructions (e.g., WMMA).
-        
-- Code breakdown:
-    
-    - For each slice (`dotIdx`):
-        
-        - Load each thread's **sub-rows** of A and **sub-columns** of B into registers.
-            
-        - Multiply and accumulate into `threadResults` using small nested loops over the sub-tiles.
-            
-- Each **warp** computes a chunk of matrix C of size:
+- Each **thread block** is responsible for computing a large tile of the output matrix
+- Within the block, computation is explicitly organized by **warps**, where each warp computes a sub-tile
+- Each **thread** within a warp computes multiple elements of the output matrix
 
-    `(WSUBN * WNITER) × (WSUBM * WMITER)`
-    
-    and each thread within the warp computes:
-    
-    `WNITER × WMITER small blocks of size (TM × TN).`
-    
+This organization leads to a natural memory access pattern:
+1. All threads in a block cooperatively load data from global memory into shared memory
+2. Warps then independently load elements from shared memory into registers
+3. Each thread performs multiple multiply-accumulate operations using those register values
 
-#### Why It Improves Performance
+By structuring the work this way, warps can operate independently with minimal synchronization, reducing warp divergence and improving scheduler efficiency.
 
-- **Better warp scheduler utilization**: Warps are the unit scheduled onto warp schedulers. By warptiling, we naturally divide work into warp-sized chunks.
-    
-- **Higher register reuse**: Loading sub-tiles into registers improves **temporal locality**, reducing the need to reload from shared memory.
-    
-- **Minimized shared memory bank conflicts**: Since warps have their memory access patterns aligned, it reduces conflicts when accessing shared memory banks.
-    
-- **Improved instruction-level parallelism (ILP)**: Threads perform multiple independent multiply-adds, making better use of the GPU cores.
-    
+#### Performance Advantages
+
+1. **Warp scheduler optimization**: Since the GPU hardware schedules execution at the warp level, organizing computation by warps leads to more efficient scheduling and fewer stalls
+
+2. **Enhanced register locality**: Data loaded into registers by threads within a warp stays local to that warp, improving cache efficiency
+
+3. **Reduced synchronization overhead**: By making warps the primary computational unit, we minimize the need for costly block-wide synchronization
+
+4. **Better memory coalescing**: When threads within a warp access memory together, their access patterns naturally align with hardware memory transaction sizes
+
+5. **More effective latency hiding**: With warps operating independently, the GPU can better hide memory latency by swapping between warps when one is waiting for memory
 
 #### Results
+
 Kernel Execution Performance: 9611.92 GFLOPS.
 
-**This is 7.11 (611%) times faster than our baseline**
+**This is 7.11× (611%) times faster than our baseline**
+
+This improvement demonstrates the critical importance of understanding and aligning algorithms with the GPU's actual execution model rather than just its programming abstractions.
 
 ## Part 3: cuBLAS Implementation
 
@@ -310,7 +313,7 @@ Kernel Execution Performance: 9611.92 GFLOPS.
 #### Important Note on Performance Measurement
 To achieve these optimal cuBLAS performance results, it was necessary to add a warm-up run before the timed execution. This warm-up run amortizes initialization overhead, including kernel compilation, memory allocation, and internal cuBLAS configuration. Without this warm-up pass, the measured performance would be significantly lower due to these one-time initialization costs being included in the measurement.
 
-## Optional: [Bonus Question]
+## Tensor Core Implementation
 
 ### 1. TensorCore in NVIDIA Streaming Multiprocessors
 
