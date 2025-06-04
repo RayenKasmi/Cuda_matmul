@@ -4,7 +4,7 @@
 
 This project explores and benchmarks multiple CUDA matrix multiplication (matmul) kernels, with the goal of achieving cuBLAS-level performance on an NVIDIA GPU. The work includes:
 
-- Multiple handcrafted CUDA kernels with increasing levels of optimization
+- Benchmarking CUDA kernels with increasing levels of optimization
 - Performance tuning and analysis based on GPU architectural features
 - Comparisons with cuBLAS and TensorCore-accelerated implementations
 - Benchmarks conducted on an NVIDIA GeForce RTX 3070 Laptop GPU
@@ -40,7 +40,7 @@ All implementations and experiments are documented in detail, with a strong focu
 This project was inspired by the excellent article:  
 [How to Optimize a CUDA Matmul Kernel for cuBLAS-like Performance: a Worklog](https://siboehm.com/articles/22/CUDA-MMM) by **Simon Boehm**
 
-Much of the learning and experimentation was guided by the techniques explored in that work.
+Much of the learning and experimentation and kernel implementations was guided by the techniques explored in that work.
 
 ## Author
 
